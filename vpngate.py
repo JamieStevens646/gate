@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """VPN Gate SSTP 节点检测流水线（模板仓库）。
-
 流程:
   1. 抓取 VPN Gate 原始节点（官方 API，失败回退 GitHub 镜像）
   2. 只保留带 TCP 入口的 SSTP 节点（VPN Gate 的 TCP 端口即 SSTP 端口）
@@ -8,13 +7,10 @@
   4. 并发调用检测 Worker
   5. 合并静态优选域名与优选 API 端点
   6. 生成 public/data.json + public/index.html + public/nodes.txt
-
 配置全部来自环境变量。模板仓库约定：用户只需在仓库里配置 Secret `DOMAIN`，
 工作流会拼出检测地址；本地运行时可以直接设置 CHECK_WORKER。
 """
-
 from __future__ import annotations
-
 import base64
 import csv
 import io
@@ -28,34 +24,27 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
 from urllib.parse import quote, urlsplit
-
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
-
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
-
 SCHEMA_VERSION = 1
-
 # VPN Gate 没有 HTTPS 接口，官方 API 只提供 HTTP。
 DEFAULT_VPNGATE_API = "http://www.vpngate.net/api/iphone/"
 DEFAULT_VPNGATE_MIRROR = (
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json"
 )
 DEFAULT_OPTIMAL_API = ""
-
 # 占位符检测：命中任意一个就认为用户还没配置
 PLACEHOLDER_MARKERS = ("你的", "YOUR_", "YOUR-", "example.com", "yourdomain")
-
 # 静态优选域名池（可用 EDGE_HOSTS 整体覆盖）
 DEFAULT_EDGE_HOSTS = [
     "saas.sin.fan:443",
@@ -73,13 +62,11 @@ DEFAULT_EDGE_HOSTS = [
     "ctsg.cfyx.aliyun.20237737.xyz:443",
     "china-unicom.cname.cloudflare.468123.xyz:443",
 ]
-
 DATA_CENTER_ORG_KEYWORDS = [
     "GOOGLE", "AMAZON", "AWS", "MICROSOFT", "OVH", "HETZNER", "DIGITALOCEAN",
     "AKAMAI", "CLOUDFLARE", "FASTLY", "RACKSPACE", "EQUINIX", "LINODE", "VULTR",
     "HURRICANE", "TENCENT", "ALIBABA", "ALIYUN", "LEASEWEB",
 ]
-
 RESIDENTIAL_ORG_KEYWORDS = [
     "NTT EAST", "NTT WEST", "NTT COMMUNICATIONS", "NTT BROADBAND", "KDDI", "DOCOMO",
     "SOFTBANK", "AU COMMUNICATIONS", "J:COM", "JCOM", "OCN", "BIGLOBE",
@@ -87,7 +74,6 @@ RESIDENTIAL_ORG_KEYWORDS = [
     "TELUS", "ROGERS", "BELL CANADA", "VODAFONE", "ORANGE", "DEUTSCHE TELEKOM",
     "BREEZE", "TIM S.P.A", "LIBERO", "FASTWEB", "FREE FRANCE", "BT OPEN",
 ]
-
 COUNTRY_ZH = {
     "JP": "日本", "KR": "韩国", "US": "美国", "CA": "加拿大", "RU": "俄罗斯",
     "RO": "罗马尼亚", "TH": "泰国", "VN": "越南", "DE": "德国", "FR": "法国",
@@ -105,17 +91,12 @@ COUNTRY_ZH = {
     "MD": "摩尔多瓦", "AM": "亚美尼亚", "KZ": "哈萨克斯坦", "UZ": "乌兹别克斯坦",
     "MN": "蒙古", "NP": "尼泊尔", "LK": "斯里兰卡", "MM": "缅甸",
 }
-
 _PROTO_TCP_RE = re.compile(r"^proto\s+(tcp|tcp4|tcp6|tcp-client)\b", re.M)
 _REMOTE_RE = re.compile(r"^remote\s+(\S+)\s+(\d+)", re.M)
-
-
 # ---------------------------------------------------------------------------
 # 日志与错误
 # ---------------------------------------------------------------------------
 _section: str | None = None
-
-
 def log(section: str, msg: str = "") -> None:
     global _section
     if section != _section:
@@ -123,17 +104,11 @@ def log(section: str, msg: str = "") -> None:
         _section = section
     if msg:
         print(msg, flush=True)
-
-
 class ConfigError(Exception):
     """配置缺失或非法；main 会把它转成可读的失败信息。"""
-
-
 def die(section: str, msg: str, code: int = 2) -> None:
     log(section, f"[失败] {msg}")
     raise SystemExit(code)
-
-
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
@@ -148,8 +123,6 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
     if value < minimum:
         raise ConfigError(f"{name} 不能小于 {minimum}，当前值：{value}")
     return value
-
-
 def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -161,11 +134,8 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
     if value < minimum:
         raise ConfigError(f"{name} 不能小于 {minimum}，当前值：{value}")
     return value
-
-
 def normalize_worker_base(raw: str) -> str:
     """把 CHECK_WORKER / DOMAIN 归一化成以 `sstp=vpn:vpn@` 结尾的检测地址前缀。
-
     允许的写法：
       - https://abc.workers.dev/check?sstp=vpn:vpn@
       - abc.workers.dev                （自动补 https:// 与 /check?sstp=vpn:vpn@）
@@ -189,11 +159,9 @@ def normalize_worker_base(raw: str) -> str:
     parts = urlsplit(value)
     if not parts.netloc:
         raise ConfigError(f"无法解析检测 Worker 地址：{value!r}")
-
     path = parts.path.rstrip("/")
     if not path.endswith("/check"):
         path = path + "/check"
-
     query = parts.query
     if "sstp=" not in query:
         query = (query + "&" if query else "") + "sstp=vpn:vpn@"
@@ -206,8 +174,6 @@ def normalize_worker_base(raw: str) -> str:
                     params[i] = "sstp=" + (target or "vpn:vpn") + "@"
         query = "&".join(params)
     return f"{parts.scheme}://{parts.netloc}{path}?{query}"
-
-
 def normalize_endpoint(raw: str) -> str | None:
     """把 `IP:端口` / 域名 / IPv6 归一化成可用的 `host:port` 或 `[v6]:port`。"""
     text = (raw or "").strip()
@@ -216,7 +182,6 @@ def normalize_endpoint(raw: str) -> str | None:
     text = text.split("#", 1)[0].strip().split("/", 1)[0].strip()
     if not text:
         return None
-
     host: str
     port: str
     if text.startswith("["):
@@ -235,7 +200,6 @@ def normalize_endpoint(raw: str) -> str | None:
             host, port = text, "443"
         if colons <= 1 and not re.fullmatch(r"[A-Za-z0-9.-]+", host):
             return None
-
     try:
         port_number = int(port)
     except ValueError:
@@ -245,8 +209,6 @@ def normalize_endpoint(raw: str) -> str | None:
     if ":" in host:
         return f"[{host}]:{port_number}"
     return f"{host}:{port_number}"
-
-
 def parse_edge_hosts(raw: str) -> list[str]:
     endpoints: list[str] = []
     seen: set[str] = set()
@@ -256,21 +218,12 @@ def parse_edge_hosts(raw: str) -> list[str]:
             seen.add(endpoint)
             endpoints.append(endpoint)
     return endpoints
-
-
 def derive_nodes_url() -> str:
-    """从 GITHUB_REPOSITORY 推导 nodes.txt 地址；本地运行回退占位。"""
+    """优先读取环境变量 NODES_URL，没有则使用固定地址"""
     explicit = os.environ.get("NODES_URL", "").strip()
     if explicit:
         return explicit
-    repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
-    if "/" in repo:
-        owner, name = repo.split("/", 1)
-        if owner and name:
-            return f"https://{owner}.github.io/{name}/nodes.txt"
-    return "https://<owner>.github.io/<repo>/nodes.txt"
-
-
+    return "https://JamieStevens646.github.io/gate/nodes.txt"
 @dataclass(frozen=True)
 class Config:
     vpngate_api: str
@@ -289,7 +242,6 @@ class Config:
     min_success_ratio: float
     max_residential_per_country: int
     max_datacenter_per_country: int
-
     @classmethod
     def load(cls) -> "Config":
         raw_worker = os.environ.get("CHECK_WORKER", "").strip()
@@ -298,14 +250,12 @@ class Config:
             if domain:
                 raw_worker = f"https://{domain}/check?sstp=vpn:vpn@"
         worker_base = normalize_worker_base(raw_worker)
-
         static_raw = os.environ.get("HOSTS_ENTRY", "").strip()
         if not static_raw:
             static_raw = os.environ.get("EDGE_HOSTS", "").strip()
         edge_hosts = parse_edge_hosts(static_raw) if static_raw else []
         if not edge_hosts:
             edge_hosts = [h for h in (normalize_endpoint(x) for x in DEFAULT_EDGE_HOSTS) if h]
-
         return cls(
             vpngate_api=os.environ.get("VPNGATE_API", DEFAULT_VPNGATE_API),
             vpngate_mirror=os.environ.get("VPNGATE_MIRROR", DEFAULT_VPNGATE_MIRROR),
@@ -324,8 +274,6 @@ class Config:
             max_residential_per_country=_env_int("MAX_RESIDENTIAL_PER_COUNTRY", 20),
             max_datacenter_per_country=_env_int("MAX_DATACENTER_PER_COUNTRY", 10),
         )
-
-
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
@@ -349,8 +297,6 @@ def make_session(pool_size: int = 32, retries: int = 2) -> requests.Session:
     session.mount("http://", adapter)
     session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; gate-checker)"})
     return session
-
-
 # ---------------------------------------------------------------------------
 # 数据抓取与解析
 # ---------------------------------------------------------------------------
@@ -366,7 +312,6 @@ def fetch_vpngate(cfg: Config, session: requests.Session) -> tuple[list[dict[str
         raise RuntimeError("官方 API 返回 0 行数据")
     except Exception as exc:  # noqa: BLE001 - 需要降级到镜像
         log("VPN GATE", f"官方 API 获取失败: {exc}")
-
     try:
         log("VPN GATE", f"回退镜像: {cfg.vpngate_mirror}")
         resp = session.get(cfg.vpngate_mirror, timeout=cfg.http_timeout)
@@ -378,8 +323,6 @@ def fetch_vpngate(cfg: Config, session: requests.Session) -> tuple[list[dict[str
     except Exception as exc:  # noqa: BLE001
         log("VPN GATE", f"回退镜像也失败: {exc}")
     die("VPN GATE", "官方 API 与回退镜像均不可用，数据源完全失败")
-
-
 def parse_csv(text: str) -> list[dict[str, Any]]:
     lines = [ln for ln in text.splitlines() if ln.strip()]
     header_idx = None
@@ -389,16 +332,13 @@ def parse_csv(text: str) -> list[dict[str, Any]]:
             break
     if header_idx is None:
         raise RuntimeError("找不到 CSV 表头行 (HostName)")
-
     header = [h.strip().lstrip("*").lower() for h in lines[header_idx].lstrip("#").split(",")]
     column = {name: idx for idx, name in enumerate(header) if name}
-
     def pick(*names: str, default: int | None = None) -> int | None:
         for name in names:
             if name in column:
                 return column[name]
         return default
-
     idx_host = pick("hostname", default=0)
     idx_ip = pick("ip", default=1)
     idx_long = pick("countrylong", default=5)
@@ -411,7 +351,6 @@ def parse_csv(text: str) -> list[dict[str, Any]]:
             (i for i, name in enumerate(header) if "base64" in name),
             len(header) - 1,
         )
-
     rows: list[dict[str, Any]] = []
     for line in lines[header_idx + 1:]:
         if line.startswith(("*", "#")):
@@ -422,21 +361,17 @@ def parse_csv(text: str) -> list[dict[str, Any]]:
             continue
         if len(fields) <= max(idx_host or 0, idx_ip or 0):
             continue
-
         def cell(index: int | None) -> str:
             if index is None or index >= len(fields):
                 return ""
             return fields[index].strip()
-
         host = cell(idx_host)
         ip = cell(idx_ip)
         if not host or not ip:
             continue
-
         def to_int(index: int | None) -> int | None:
             raw = cell(index)
             return int(raw) if raw.isdigit() else None
-
         rows.append(
             {
                 "host": host,
@@ -449,8 +384,6 @@ def parse_csv(text: str) -> list[dict[str, Any]]:
             }
         )
     return rows
-
-
 def parse_mirror_json(data: Any) -> list[dict[str, Any]]:
     servers: list[dict[str, Any]] = []
     items = data if isinstance(data, list) else [data]
@@ -459,7 +392,6 @@ def parse_mirror_json(data: Any) -> list[dict[str, Any]]:
             servers.extend(item["servers"])
         elif isinstance(item, dict) and item.get("hostname"):
             servers.append(item)
-
     rows: list[dict[str, Any]] = []
     for server in servers:
         if not isinstance(server, dict):
@@ -468,13 +400,11 @@ def parse_mirror_json(data: Any) -> list[dict[str, Any]]:
         ip = str(server.get("ip") or "").strip()
         if not host or not ip:
             continue
-
         def as_int(key: str) -> int | None:
             try:
                 return int(str(server.get(key) or "").strip())
             except (TypeError, ValueError):
                 return None
-
         rows.append(
             {
                 "host": host,
@@ -493,8 +423,6 @@ def parse_mirror_json(data: Any) -> list[dict[str, Any]]:
             }
         )
     return rows
-
-
 # ---------------------------------------------------------------------------
 # 筛选 SSTP 节点
 # ---------------------------------------------------------------------------
@@ -507,7 +435,6 @@ class Node:
     country_code: str
     ping: int | None = None
     score: int | None = None
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "host": self.host,
@@ -518,8 +445,6 @@ class Node:
             "ping": self.ping,
             "score": self.score,
         }
-
-
 def to_sstp_nodes(rows: Iterable[dict[str, Any]]) -> list[Node]:
     nodes: list[Node] = []
     for row in rows:
@@ -538,14 +463,12 @@ def to_sstp_nodes(rows: Iterable[dict[str, Any]]) -> list[Node]:
         port = int(match.group(2))
         if not 1 <= port <= 65535:
             continue
-
         host = (row.get("host") or "").strip().lower()
         if not host:
             continue
         # VPN Gate 主机名有时是 public-vpn-153，有时已是完整域名
         if "." not in host:
             host = f"{host}.opengw.net"
-
         nodes.append(
             Node(
                 host=host,
@@ -558,8 +481,6 @@ def to_sstp_nodes(rows: Iterable[dict[str, Any]]) -> list[Node]:
             )
         )
     return nodes
-
-
 def dedupe_nodes(nodes: Iterable[Node]) -> list[Node]:
     seen: set[tuple[str, int]] = set()
     unique: list[Node] = []
@@ -570,16 +491,12 @@ def dedupe_nodes(nodes: Iterable[Node]) -> list[Node]:
         seen.add(key)
         unique.append(node)
     return unique
-
-
 def prioritize(nodes: list[Node]) -> list[Node]:
     """按 Ping 升序、Score 降序预排序，让抽样先测质量更好的节点。"""
     return sorted(
         nodes,
         key=lambda n: (n.ping is None, n.ping or 0, -(n.score or 0), n.host),
     )
-
-
 # ---------------------------------------------------------------------------
 # 分类（以 Worker 的出口信息为准，缺失时才看 Operator 关键字）
 # ---------------------------------------------------------------------------
@@ -595,8 +512,6 @@ def classify_network(org: str | None, is_datacenter: bool | None) -> str:
         if any(keyword in upper for keyword in RESIDENTIAL_ORG_KEYWORDS):
             return "residential"
     return "unknown"
-
-
 # ---------------------------------------------------------------------------
 # 检测
 # ---------------------------------------------------------------------------
@@ -629,7 +544,6 @@ def check_one(
             result["error"] = f"HTTP {response.status_code}"
             result["worker_error"] = True
             return result
-
         payload = response.json()
         success = bool(payload.get("success"))
         result["success"] = success
@@ -639,7 +553,6 @@ def check_one(
         result["error"] = None if success else (
             payload.get("error") or payload.get("message") or "check failed"
         )
-
         exit_info = payload.get("exit") or {}
         if success and exit_info:
             asn = exit_info.get("asn") or {}
@@ -662,8 +575,6 @@ def check_one(
         result["error"] = f"{type(exc).__name__}: {exc}"
         result["worker_error"] = True
         return result
-
-
 def check_all(
     nodes: list[Node],
     session: requests.Session,
@@ -684,7 +595,6 @@ def check_all(
                 results.append(future.result())
         except TimeoutError:
             log("CLOUDFLARE WORKER", f"整体检测超时（{cfg.deadline_s:.0f}s），未完成的节点按失败处理")
-
     timed_out = 0
     for future in pending:
         node = futures[future]
@@ -715,8 +625,6 @@ def check_all(
         results.append(stub)
         timed_out += 1
     return results, timed_out
-
-
 # ---------------------------------------------------------------------------
 # 优选入口
 # ---------------------------------------------------------------------------
@@ -744,8 +652,6 @@ def fetch_optimal_endpoints(cfg: Config, session: requests.Session) -> list[str]
         except Exception as exc:  # noqa: BLE001
             log("OPTIMAL API", f"拉取优选 API 失败 ({url}): {exc}")
     return endpoints
-
-
 def get_combined_edge_hosts(cfg: Config, session: requests.Session) -> list[str]:
     api_endpoints = fetch_optimal_endpoints(cfg, session)
     combined: list[str] = []
@@ -761,16 +667,12 @@ def get_combined_edge_hosts(cfg: Config, session: requests.Session) -> list[str]
         f"入口地址池: 静态/配置 {len(cfg.edge_hosts)} 个, API {len(api_endpoints)} 个, 合并 {len(combined)} 个",
     )
     return combined
-
-
 # ---------------------------------------------------------------------------
 # 产物
 # ---------------------------------------------------------------------------
 def sanitize_remark(text: str) -> str:
     """备注会出现在 nodes.txt 的 `入口#备注$链接` 里，去掉分隔符与换行。"""
     return re.sub(r"[#$\r\n]", "", text).strip() or "节点"
-
-
 def build_outputs(
     results: list[dict[str, Any]],
     raw_count: int,
@@ -791,7 +693,6 @@ def build_outputs(
         if group["name"] == code and name:
             group["name"] = name
         group["nodes"].append(node)
-
     for group in countries.values():
         group["count"] = len(group["nodes"])
         group["residential"] = sum(1 for n in group["nodes"] if n.get("residential") == "residential")
@@ -800,7 +701,6 @@ def build_outputs(
         group["nodes"].sort(
             key=lambda n: (n.get("residential") != "residential", n.get("latency_ms") is None, n.get("latency_ms") or 0)
         )
-
     stats = {
         "raw_nodes": raw_count,
         "sstp_nodes": sstp_count,
@@ -823,8 +723,6 @@ def build_outputs(
         "stats": stats,
         "countries": countries,
     }
-
-
 def build_nodes_text(data: dict[str, Any], edge_hosts: list[str], cfg: Config) -> str:
     if not edge_hosts:
         raise ConfigError("优选入口池为空，无法生成 nodes.txt")
@@ -857,8 +755,6 @@ def build_nodes_text(data: dict[str, Any], edge_hosts: list[str], cfg: Config) -
             index += 1
             lines.append(f"{entry}#{sanitize_remark(f'{name}-{kind}-{counters[kind_key]:02d}')}${link}")
     return "\n".join(lines) + ("\n" if lines else "")
-
-
 def atomic_write_text(path: str, text: str) -> None:
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
@@ -866,8 +762,6 @@ def atomic_write_text(path: str, text: str) -> None:
     with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(text)
     os.replace(temp_path, path)
-
-
 def write_outputs(
     data: dict[str, Any], cfg: Config, edge_hosts: list[str]
 ) -> tuple[str, str, str, str]:
@@ -875,9 +769,7 @@ def write_outputs(
     data_path = os.path.join(cfg.public_dir, "data.json")
     html_path = os.path.join(cfg.public_dir, "index.html")
     nodes_path = os.path.join(cfg.public_dir, "nodes.txt")
-
     atomic_write_text(data_path, json.dumps(data, ensure_ascii=False, separators=(",", ":")))
-
     if os.path.exists(cfg.template_html):
         with open(cfg.template_html, "r", encoding="utf-8") as handle:
             html = handle.read()
@@ -893,8 +785,6 @@ def write_outputs(
     nodes_text = build_nodes_text(data, edge_hosts, cfg)
     atomic_write_text(nodes_path, nodes_text)
     return data_path, html_path, nodes_path, nodes_text
-
-
 def write_step_summary(data: dict[str, Any], nodes_count: int, cfg: Config) -> None:
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
     if not summary_path:
@@ -921,8 +811,6 @@ def write_step_summary(data: dict[str, Any], nodes_count: int, cfg: Config) -> N
     rows.append(f"\n订阅地址：`{cfg.nodes_url}`\n")
     with open(summary_path, "a", encoding="utf-8") as handle:
         handle.write("".join(rows))
-
-
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -932,44 +820,33 @@ def main() -> None:
         cfg = Config.load()
     except ConfigError as exc:
         die("配置", str(exc))
-
     session = make_session(pool_size=cfg.concurrency)
     log("CONFIG", f"检测地址: {cfg.worker_base.rsplit('?', 1)[0]}?sstp=***")
     log("CONFIG", f"并发 {cfg.concurrency}, 单节点超时 {cfg.check_timeout}s, 整体截止 {cfg.deadline_s}s")
-
     rows, source = fetch_vpngate(cfg, session)
     raw_count = len(rows)
     if raw_count == 0:
         die("VPN GATE", "VPN Gate 返回 0 个原始节点，拒绝生成空结果")
-
     sstp_nodes = to_sstp_nodes(rows)
     sstp_count = len(sstp_nodes)
     if sstp_count == 0:
         die("VPN GATE", f"从 {raw_count} 个原始节点中没有解析出任何 SSTP(TCP) 节点")
-
     unique_nodes = prioritize(dedupe_nodes(sstp_nodes))
     if cfg.max_check_nodes > 0:
         unique_nodes = unique_nodes[: cfg.max_check_nodes]
-
     log("VPN GATE", f"原始节点 {raw_count}, SSTP {sstp_count}, 去重后 {len(unique_nodes)}")
     log("CLOUDFLARE WORKER", f"提交检测: {len(unique_nodes)}")
-
     check_started = time.time()
     results, timed_out = check_all(unique_nodes, session, cfg)
     elapsed = time.time() - check_started
-
     success = [r for r in results if r.get("success")]
     failed = [r for r in results if not r.get("success")]
     worker_errors = [r for r in failed if r.get("worker_error")]
-
     log("CLOUDFLARE WORKER", f"成功 {len(success)}, 失败 {len(failed)}（Worker 异常 {len(worker_errors)}）, 用时 {elapsed:.1f}s")
-
     if unique_nodes and not success and len(worker_errors) == len(unique_nodes):
         die("CLOUDFLARE WORKER", "检测 Worker 全部请求异常，本次不发布（保留上一次产物）")
-
     if unique_nodes and not success:
         die("RESULT", "所有节点检测失败，本次不发布（保留上一次产物）")
-
     ratio = len(success) / len(unique_nodes) if unique_nodes else 0.0
     if cfg.min_success_ratio > 0 and ratio < cfg.min_success_ratio:
         die(
@@ -977,7 +854,6 @@ def main() -> None:
             f"成功率 {ratio:.1%} 低于阈值 {cfg.min_success_ratio:.1%}，"
             "本次不发布（保留上一次产物）；确认无误可调低 MIN_SUCCESS_RATIO",
         )
-
     worker_host = urlsplit(cfg.worker_base).netloc or "unknown"
     data = build_outputs(
         results=results,
@@ -988,7 +864,6 @@ def main() -> None:
         duration_s=time.time() - started,
         timed_out=timed_out,
     )
-
     edge_hosts = get_combined_edge_hosts(cfg, session)
     data_path, html_path, nodes_path, nodes_text = write_outputs(data, cfg, edge_hosts)
     nodes_count = len([line for line in nodes_text.splitlines() if line.strip()])
@@ -999,8 +874,6 @@ def main() -> None:
     log("USAGE", f"把 {cfg.nodes_url} 填入 edgetunnel 后台「自定义优选 IP」")
     write_step_summary(data, nodes_count, cfg)
     log("WEBSITE", "完成（GitHub Pages 部署由 workflow 执行）")
-
-
 if __name__ == "__main__":
     try:
         main()
