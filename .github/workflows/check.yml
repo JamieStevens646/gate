@@ -1,5 +1,12 @@
 name: VPN Gate Node Check
 
+# 模板仓库默认不配置定时任务：需要自动更新时，把下面的注释替换成你自己的 cron。
+# 注意：GitHub 调度最小间隔约 5 分钟，但通常会延迟几分钟；仓库连续 60 天无提交会让定时任务自动停用。
+#
+# on:
+#   schedule:
+#     - cron: '*/30 * * * *'
+
 on:
   workflow_dispatch:
     inputs:
@@ -15,8 +22,6 @@ on:
         description: '单节点检测超时（秒）'
         required: false
         default: '25'
-  schedule:
-    - cron: '0 18 * * *'
 
 permissions:
   contents: read
@@ -46,6 +51,16 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Validate worker secret
+        env:
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          if [ -z "${DOMAIN}" ]; then
+            echo "::error::未配置检测地址。请在仓库 Settings → Secrets and variables → Actions 中新增 Secret：DOMAIN（只填 Worker 的 host，例如 abc.workers.dev）"
+            exit 1
+          fi
+          echo "检测域名已配置：${DOMAIN}"
 
       - name: Run pipeline
         env:
